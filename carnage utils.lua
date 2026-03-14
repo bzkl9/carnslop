@@ -17,7 +17,7 @@
 -- • Notes GUI is large and draggable
 -- • Notes GUI stays open even if Leave Log GUI is closed
 -- • Each note line gets a fixed in-game timestamp when first created
--- • Editing a line keeps its original timestamp
+-- • Editing a line keeps the original timestamp
 -- • Deleting a whole line removes that timestamp entry
 -- • Notes + leave logs persist across re-runs via _G
 --============================================================
@@ -60,9 +60,8 @@ _G.BlackenedTrailTrackerPersist = _G.BlackenedTrailTrackerPersist or {
 	noteLines = {}, -- {id=number, timeText=string, text=string}
 	nextNoteId = 1,
 
-	-- text sync cache
-	lastRawNotesText = "",
-	lastLineIds = {}, -- parallel to visual editable lines
+	-- cache for syncing edits
+	lastRenderedLines = {}, -- { {id=?, timeText=?, text=?}, ... }
 
 	mainGuiOpen = true,
 	notesGuiOpen = false,
@@ -378,12 +377,26 @@ local function splitLinesPreserveBlank(str)
 		startIndex = b + 1
 	end
 
-	-- if text ends with newline, preserve final blank line
 	if string.sub(str, -1) == "\n" then
 		table.insert(out, "")
 	end
 
 	return out
+end
+
+local function stripLeadingTimestamps(line)
+	line = tostring(line or "")
+	-- removes repeated leading [time] blocks like:
+	-- [12:30 AM] text
+	-- [12:30 AM] [12:31 AM] text
+	while true do
+		local stripped, count = line:gsub("^%b[]%s*", "", 1)
+		if count == 0 then
+			break
+		end
+		line = stripped
+	end
+	return line
 end
 
 local function getDisplayTextFromNoteLines(noteLines)
@@ -394,17 +407,24 @@ local function getDisplayTextFromNoteLines(noteLines)
 	return table.concat(lines, "\n")
 end
 
+local function copyRenderedLines()
+	local out = {}
+	for _, note in ipairs(PERSIST.noteLines) do
+		table.insert(out, {
+			id = note.id,
+			timeText = note.timeText,
+			text = note.text,
+		})
+	end
+	return out
+end
+
 local function applyNotesTextToBox()
 	if not controller.notesBox then return end
 	controller.isApplyingNotesText = true
 	controller.notesBox.Text = getDisplayTextFromNoteLines(PERSIST.noteLines)
 	controller.isApplyingNotesText = false
-
-	PERSIST.lastRawNotesText = controller.notesBox.Text
-	PERSIST.lastLineIds = {}
-	for _, note in ipairs(PERSIST.noteLines) do
-		table.insert(PERSIST.lastLineIds, note.id)
-	end
+	PERSIST.lastRenderedLines = copyRenderedLines()
 end
 
 local function getNextNoteId()
@@ -413,78 +433,50 @@ local function getNextNoteId()
 	return id
 end
 
-local function cloneNoteLine(note)
-	return {
-		id = note.id,
-		timeText = note.timeText,
-		text = note.text,
-	}
-end
-
 local function syncNotesFromText(rawText)
 	rawText = trimCR(rawText or "")
 	local inputLines = splitLinesPreserveBlank(rawText)
+	local previousRendered = PERSIST.lastRenderedLines or {}
 
-	-- Build editable plain-text version from current persisted notes
-	local oldEditableLines = {}
-	for _, note in ipairs(PERSIST.noteLines) do
-		table.insert(oldEditableLines, tostring(note.text or ""))
-	end
-
-	local oldIds = PERSIST.lastLineIds or {}
 	local newNoteLines = {}
+	local prevCount = #previousRendered
+	local newCount = #inputLines
+	local count = math.max(prevCount, newCount)
 
-	local maxCount = math.max(#inputLines, #oldEditableLines)
+	for i = 1, count do
+		local newRaw = inputLines[i]
+		local oldRendered = previousRendered[i]
 
-	for i = 1, maxCount do
-		local newText = inputLines[i]
-		local oldText = oldEditableLines[i]
-		local oldId = oldIds[i]
+		if newRaw ~= nil then
+			local cleanText = stripLeadingTimestamps(newRaw)
 
-		if newText ~= nil then
-			if oldId ~= nil then
-				-- existing line edited in place: preserve its timestamp/id
-				local oldNote = nil
-				for _, note in ipairs(PERSIST.noteLines) do
-					if note.id == oldId then
-						oldNote = note
-						break
-					end
-				end
-
-				if oldNote then
-					table.insert(newNoteLines, {
-						id = oldNote.id,
-						timeText = oldNote.timeText,
-						text = newText,
-					})
-				else
-					table.insert(newNoteLines, {
-						id = getNextNoteId(),
-						timeText = getCurrentGameTimeText(),
-						text = newText,
-					})
-				end
+			if oldRendered then
+				-- existing line: preserve original id + timestamp
+				table.insert(newNoteLines, {
+					id = oldRendered.id,
+					timeText = oldRendered.timeText,
+					text = cleanText,
+				})
 			else
-				-- new line appended/inserted beyond previous tracked range
+				-- brand new line
 				table.insert(newNoteLines, {
 					id = getNextNoteId(),
 					timeText = getCurrentGameTimeText(),
-					text = newText,
+					text = cleanText,
 				})
 			end
 		else
-			-- line deleted, do nothing (drop it)
+			-- deleted line: drop it
 		end
 	end
 
-	-- Remove completely blank trailing lines so pressing Enter at the end
-	-- doesn't create phantom timestamped rows until actual text is added.
+	-- remove empty trailing lines so a blank final line does not create a note
 	while #newNoteLines > 0 and tostring(newNoteLines[#newNoteLines].text or "") == "" do
 		table.remove(newNoteLines, #newNoteLines)
 	end
 
 	PERSIST.noteLines = newNoteLines
+	PERSIST.lastRenderedLines = copyRenderedLines()
 end
 
 --========================
@@ -493,9 +485,7 @@ end
 local function clearTextChildren(parent)
 	if not parent then return end
 	for _, child in ipairs(parent:GetChildren()) do
-		if child:IsA("TextLabel") then
-			child:Destroy()
-		end
+		if child:IsA("TextLabel") then child:Destroy() end
 	end
 end
 
@@ -1085,4 +1075,4 @@ rebuildLeaveLogUI()
 applyNotesTextToBox()
 refreshWindowVisibility()
 
-print("[BlackenedTrailTracker] Loaded. L toggles leave log GUI. Notes use stable per-line IDs so old timestamps stay locked when new lines are added.")
+print("[BlackenedTrailTracker] Loaded. L toggles leave log GUI. Notes strip repeated visible timestamps so old lines keep their original time.")
