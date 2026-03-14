@@ -1,5 +1,5 @@
 --============================================================
--- Blackened Trail Tracker + Leave Log + Separate Notes Window
+-- Blackened Trail Tracker + Leave Log + Notes + Blackened Says
 --============================================================
 -- LocalScript intended for StarterPlayerScripts
 --
@@ -19,13 +19,20 @@
 -- • Each note line gets a fixed in-game timestamp when first created
 -- • Editing a line keeps the original timestamp
 -- • Deleting a whole line removes that timestamp entry
--- • Notes + leave logs persist across re-runs via _G
+-- • Separate Blackened Says GUI opened/closed by button in Leave Log GUI
+-- • Captures ONLY what the current Blackened says
+-- • Uses normal chat + legacy chat + bubble chat style capture
+-- • Blackened chat log resets when a NEW Blackened appears
+-- • Blackened lines are timestamped with in-game time
 --============================================================
 
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local TextChatService = game:GetService("TextChatService")
+local ChatService = game:GetService("Chat")
+local CoreGui = game:GetService("CoreGui")
 
 local LOCAL_PLAYER = Players.LocalPlayer
 if not LOCAL_PLAYER then return end
@@ -46,28 +53,50 @@ local TOGGLE_KEY = Enum.KeyCode.L
 local GUI_NAME = "BlackenedTrailTrackerGui"
 
 local LEAVE_LOG_MAX = 120
+local BLACKENED_CHAT_MAX = 220
+
 local GUI_WATCHDOG_INTERVAL = 1.0
+local STATE_SCAN_INTERVAL = 0.45
 
 local NOTES_PLACEHOLDER = "Type notes here. Each new line gets a fixed timestamp."
+
+-- blackened chat capture tuning
+local FILTER_SLASH_IN_CHAT = true
+local FILTER_SLASH_IN_BUBBLES = false
+local IGNORE_BUBBLE_ELLIPSIS = false
+local GLOBAL_DEDUP_SECONDS = 6.0
+local BUBBLE_DELAY_SECONDS = 0.12
+local FORCE_BUBBLE_RANGE = true
+local HUGE_DISTANCE = 9e9
+local DEDUPE_BY_TEXT_ONLY = true
+local BUBBLE_MAX_PARENT_DEPTH = 20
+local BUBBLE_RETRY_PASSES = 3
+local BUBBLE_RETRY_INTERVAL = 0.18
 
 --========================
 -- PERSISTENT STORAGE
 --========================
 _G.BlackenedTrailTrackerPersist = _G.BlackenedTrailTrackerPersist or {
-	leaveLogs = {}, -- newest first: {name=string, timeText=string, t=os.time(), userId=number}
+	leaveLogs = {},
 
-	-- ordered array of lines
 	noteLines = {}, -- {id=number, timeText=string, text=string}
 	nextNoteId = 1,
-
-	-- cache for syncing edits
-	lastRenderedLines = {}, -- { {id=?, timeText=?, text=?}, ... }
+	lastRenderedLines = {},
 
 	mainGuiOpen = true,
 	notesGuiOpen = false,
+	blackenedChatGuiOpen = false,
 
 	mainGuiPos = {xScale = 0, xOffset = 20, yScale = 0, yOffset = 140},
 	notesGuiPos = {xScale = 0, xOffset = 700, yScale = 0, yOffset = 120},
+	blackenedChatGuiPos = {xScale = 0, xOffset = 470, yScale = 0, yOffset = 140},
+
+	currentBlackenedUserId = 0,
+	currentBlackenedName = "None",
+
+	blackenedChatOwnerUserId = 0,
+	blackenedChatOwnerName = "None",
+	blackenedChatEntries = {}, -- {timeText=string, text=string}
 }
 
 local PERSIST = _G.BlackenedTrailTrackerPersist
@@ -88,7 +117,7 @@ local controller = {
 	conns = {},
 	perPlayerConns = {},
 
-	activeTrails = {}, -- [userId] = {running=true, parts={}, connections={}, folder=Folder}
+	activeTrails = {},
 
 	gui = nil,
 
@@ -96,11 +125,17 @@ local controller = {
 	leaveList = nil,
 	leaveTitle = nil,
 	notesToggleButton = nil,
+	blackenedChatToggleButton = nil,
 	mainCloseBtn = nil,
 
 	notesFrame = nil,
 	notesBox = nil,
 	notesCloseBtn = nil,
+
+	blackenedChatFrame = nil,
+	blackenedChatList = nil,
+	blackenedChatTitle = nil,
+	blackenedChatCloseBtn = nil,
 
 	uiConns = {},
 
@@ -108,6 +143,14 @@ local controller = {
 
 	mainGuiOpen = PERSIST.mainGuiOpen,
 	notesGuiOpen = PERSIST.notesGuiOpen,
+	blackenedChatGuiOpen = PERSIST.blackenedChatGuiOpen,
+
+	blackenedSeen = {}, -- key -> {t=clock, pr=priority}
+	blackenedBubbleHooked = setmetatable({}, { __mode = "k" }),
+	blackenedLastTextByLabel = setmetatable({}, { __mode = "k" }),
+	blackenedRetryTokenByLabel = setmetatable({}, { __mode = "k" }),
+
+	playerBlackenedState = {}, -- [Player] = bool
 }
 
 _G.BlackenedTrailTrackerController = controller
@@ -173,10 +216,15 @@ local function disconnectAll()
 	controller.leaveList = nil
 	controller.leaveTitle = nil
 	controller.notesToggleButton = nil
+	controller.blackenedChatToggleButton = nil
 	controller.mainCloseBtn = nil
 	controller.notesFrame = nil
 	controller.notesBox = nil
 	controller.notesCloseBtn = nil
+	controller.blackenedChatFrame = nil
+	controller.blackenedChatList = nil
+	controller.blackenedChatTitle = nil
+	controller.blackenedChatCloseBtn = nil
 	controller.isApplyingNotesText = false
 end
 
@@ -197,7 +245,7 @@ local function getBestName(plr)
 end
 
 local function playerHasBlackened(plr)
-	return plr:FindFirstChild(TARGET_NAME) ~= nil
+	return plr and plr:FindFirstChild(TARGET_NAME) ~= nil
 end
 
 local function getHRP(plr)
@@ -264,8 +312,11 @@ local function isGuiAlive()
 	if not controller.mainFrame or controller.mainFrame.Parent == nil then return false end
 	if not controller.leaveList or controller.leaveList.Parent == nil then return false end
 	if not controller.notesToggleButton or controller.notesToggleButton.Parent == nil then return false end
+	if not controller.blackenedChatToggleButton or controller.blackenedChatToggleButton.Parent == nil then return false end
 	if not controller.notesFrame or controller.notesFrame.Parent == nil then return false end
 	if not controller.notesBox or controller.notesBox.Parent == nil then return false end
+	if not controller.blackenedChatFrame or controller.blackenedChatFrame.Parent == nil then return false end
+	if not controller.blackenedChatList or controller.blackenedChatList.Parent == nil then return false end
 	return true
 end
 
@@ -386,9 +437,6 @@ end
 
 local function stripLeadingTimestamps(line)
 	line = tostring(line or "")
-	-- removes repeated leading [time] blocks like:
-	-- [12:30 AM] text
-	-- [12:30 AM] [12:31 AM] text
 	while true do
 		local stripped, count = line:gsub("^%b[]%s*", "", 1)
 		if count == 0 then
@@ -451,26 +499,21 @@ local function syncNotesFromText(rawText)
 			local cleanText = stripLeadingTimestamps(newRaw)
 
 			if oldRendered then
-				-- existing line: preserve original id + timestamp
 				table.insert(newNoteLines, {
 					id = oldRendered.id,
 					timeText = oldRendered.timeText,
 					text = cleanText,
 				})
 			else
-				-- brand new line
 				table.insert(newNoteLines, {
 					id = getNextNoteId(),
 					timeText = getCurrentGameTimeText(),
 					text = cleanText,
 				})
 			end
-		else
-			-- deleted line: drop it
 		end
 	end
 
-	-- remove empty trailing lines so a blank final line does not create a note
 	while #newNoteLines > 0 and tostring(newNoteLines[#newNoteLines].text or "") == "" do
 		table.remove(newNoteLines, #newNoteLines)
 	end
@@ -480,12 +523,67 @@ local function syncNotesFromText(rawText)
 end
 
 --========================
+-- BLACKENED CHAT STATE
+--========================
+local function clearBlackenedChatFor(plr)
+	PERSIST.blackenedChatEntries = {}
+	if plr then
+		PERSIST.blackenedChatOwnerUserId = plr.UserId
+		PERSIST.blackenedChatOwnerName = getBestName(plr)
+	end
+end
+
+local function setCurrentBlackened(plr)
+	if plr and plr:IsA("Player") then
+		local uid = plr.UserId
+		local name = getBestName(plr)
+
+		local oldCurrent = PERSIST.currentBlackenedUserId
+		PERSIST.currentBlackenedUserId = uid
+		PERSIST.currentBlackenedName = name
+
+		if uid ~= oldCurrent then
+			clearBlackenedChatFor(plr)
+		end
+	else
+		PERSIST.currentBlackenedUserId = 0
+		PERSIST.currentBlackenedName = "None"
+	end
+end
+
+local function addBlackenedChatEntry(text)
+	text = trimCR(tostring(text or ""))
+	if text == "" then return end
+
+	local entry = {
+		timeText = getCurrentGameTimeText(),
+		text = text,
+	}
+
+	table.insert(PERSIST.blackenedChatEntries, 1, entry)
+	while #PERSIST.blackenedChatEntries > BLACKENED_CHAT_MAX do
+		table.remove(PERSIST.blackenedChatEntries)
+	end
+end
+
+local function findCurrentBlackenedPlayer()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if playerHasBlackened(plr) then
+			return plr
+		end
+	end
+	return nil
+end
+
+--========================
 -- UI HELPERS
 --========================
 local function clearTextChildren(parent)
 	if not parent then return end
 	for _, child in ipairs(parent:GetChildren()) do
-		if child:IsA("TextLabel") then child:Destroy() end
+		if child:IsA("TextLabel") then
+			child:Destroy()
+		end
 	end
 end
 
@@ -553,7 +651,7 @@ end
 local function makeMainGui(screen)
 	local frame = Instance.new("Frame")
 	frame.Name = "Main"
-	frame.Size = UDim2.new(0, 420, 0, 420)
+	frame.Size = UDim2.new(0, 470, 0, 440)
 	frame.Position = makeUDim2FromPersist(PERSIST.mainGuiPos, UDim2.new(0, 20, 0, 140))
 	frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
 	frame.BackgroundTransparency = 0.12
@@ -625,7 +723,7 @@ local function makeMainGui(screen)
 	leaveTitle.Parent = frame
 
 	local notesToggleButton = Instance.new("TextButton")
-	notesToggleButton.Position = UDim2.new(1, -132, 0, 62)
+	notesToggleButton.Position = UDim2.new(0, 12, 0, 92)
 	notesToggleButton.Size = UDim2.new(0, 120, 0, 28)
 	notesToggleButton.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
 	notesToggleButton.BorderSizePixel = 0
@@ -640,11 +738,27 @@ local function makeMainGui(screen)
 	notesToggleCorner.CornerRadius = UDim.new(0, 8)
 	notesToggleCorner.Parent = notesToggleButton
 
-	local leaveList = makeScrollingFrame(frame, UDim2.new(0, 12, 0, 98), UDim2.new(1, -24, 1, -110))
+	local blackenedChatToggleButton = Instance.new("TextButton")
+	blackenedChatToggleButton.Position = UDim2.new(0, 142, 0, 92)
+	blackenedChatToggleButton.Size = UDim2.new(0, 160, 0, 28)
+	blackenedChatToggleButton.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+	blackenedChatToggleButton.BorderSizePixel = 0
+	blackenedChatToggleButton.Font = Enum.Font.SourceSansBold
+	blackenedChatToggleButton.TextSize = 18
+	blackenedChatToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	blackenedChatToggleButton.Text = controller.blackenedChatGuiOpen and "Close Says Log" or "Open Says Log"
+	blackenedChatToggleButton.ZIndex = 12
+	blackenedChatToggleButton.Parent = frame
+
+	local blackenedToggleCorner = Instance.new("UICorner")
+	blackenedToggleCorner.CornerRadius = UDim.new(0, 8)
+	blackenedToggleCorner.Parent = blackenedChatToggleButton
+
+	local leaveList = makeScrollingFrame(frame, UDim2.new(0, 12, 0, 130), UDim2.new(1, -24, 1, -142))
 
 	addDragBehavior(frame, "mainGuiPos")
 
-	return frame, leaveList, leaveTitle, notesToggleButton, closeBtn
+	return frame, leaveList, leaveTitle, notesToggleButton, blackenedChatToggleButton, closeBtn
 end
 
 --========================
@@ -742,6 +856,79 @@ local function makeNotesGui(screen)
 end
 
 --========================
+-- BLACKENED CHAT GUI
+--========================
+local function makeBlackenedChatGui(screen)
+	local frame = Instance.new("Frame")
+	frame.Name = "BlackenedChatWindow"
+	frame.Size = UDim2.new(0, 520, 0, 420)
+	frame.Position = makeUDim2FromPersist(PERSIST.blackenedChatGuiPos, UDim2.new(0, 470, 0, 140))
+	frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	frame.BackgroundTransparency = 0.08
+	frame.BorderSizePixel = 0
+	frame.Active = true
+	frame.Visible = controller.blackenedChatGuiOpen
+	frame.ZIndex = 40
+	frame.Parent = screen
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 1
+	stroke.Transparency = 0.55
+	stroke.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.new(0, 12, 0, 10)
+	title.Size = UDim2.new(1, -90, 0, 24)
+	title.Font = Enum.Font.SourceSansBold
+	title.TextSize = 24
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = Color3.fromRGB(255, 255, 255)
+	title.Text = "Blackened Says"
+	title.ZIndex = 41
+	title.Parent = frame
+
+	local closeBtn = Instance.new("TextButton")
+	closeBtn.Position = UDim2.new(1, -36, 0, 10)
+	closeBtn.Size = UDim2.new(0, 24, 0, 24)
+	closeBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+	closeBtn.BorderSizePixel = 0
+	closeBtn.Font = Enum.Font.SourceSansBold
+	closeBtn.TextSize = 18
+	closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	closeBtn.Text = "×"
+	closeBtn.ZIndex = 42
+	closeBtn.Parent = frame
+
+	local closeCorner = Instance.new("UICorner")
+	closeCorner.CornerRadius = UDim.new(0, 8)
+	closeCorner.Parent = closeBtn
+
+	local info = Instance.new("TextLabel")
+	info.BackgroundTransparency = 1
+	info.Position = UDim2.new(0, 12, 0, 38)
+	info.Size = UDim2.new(1, -24, 0, 18)
+	info.Font = Enum.Font.SourceSans
+	info.TextSize = 16
+	info.TextXAlignment = Enum.TextXAlignment.Left
+	info.TextColor3 = Color3.fromRGB(180, 180, 180)
+	info.Text = "Only captures what the current Blackened says."
+	info.ZIndex = 41
+	info.Parent = frame
+
+	local list = makeScrollingFrame(frame, UDim2.new(0, 12, 0, 64), UDim2.new(1, -24, 1, -76))
+	list.ZIndex = 41
+
+	addDragBehavior(frame, "blackenedChatGuiPos")
+
+	return frame, list, title, closeBtn
+end
+
+--========================
 -- UI REBUILD
 --========================
 local function rebuildLeaveLogUI()
@@ -779,6 +966,53 @@ local function rebuildLeaveLogUI()
 	end
 end
 
+local function rebuildBlackenedChatUI()
+	if not controller.blackenedChatList then return end
+	clearTextChildren(controller.blackenedChatList)
+
+	if controller.blackenedChatTitle then
+		if PERSIST.currentBlackenedUserId ~= 0 then
+			controller.blackenedChatTitle.Text = "Blackened Says — " .. tostring(PERSIST.currentBlackenedName or "Unknown")
+		elseif PERSIST.blackenedChatOwnerUserId ~= 0 then
+			controller.blackenedChatTitle.Text = "Blackened Says — Last: " .. tostring(PERSIST.blackenedChatOwnerName or "Unknown")
+		else
+			controller.blackenedChatTitle.Text = "Blackened Says — None"
+		end
+	end
+
+	if #PERSIST.blackenedChatEntries == 0 then
+		local row = Instance.new("TextLabel")
+		row.BackgroundTransparency = 1
+		row.Size = UDim2.new(1, -4, 0, 22)
+		row.Font = Enum.Font.SourceSansItalic
+		row.TextSize = 18
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.TextColor3 = Color3.fromRGB(180, 180, 180)
+		row.ZIndex = 41
+		row.Text = "No blackened chat yet."
+		row.Parent = controller.blackenedChatList
+		return
+	end
+
+	for i = #PERSIST.blackenedChatEntries, 1, -1 do
+		local e = PERSIST.blackenedChatEntries[i]
+
+		local row = Instance.new("TextLabel")
+		row.BackgroundTransparency = 1
+		row.Size = UDim2.new(1, -4, 0, 0)
+		row.AutomaticSize = Enum.AutomaticSize.Y
+		row.Font = Enum.Font.SourceSans
+		row.TextSize = 18
+		row.TextWrapped = true
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.TextYAlignment = Enum.TextYAlignment.Top
+		row.TextColor3 = Color3.fromRGB(235, 235, 235)
+		row.ZIndex = 41
+		row.Text = string.format("• [%s] %s", tostring(e.timeText or "??"), tostring(e.text or ""))
+		row.Parent = controller.blackenedChatList
+	end
+end
+
 local function refreshWindowVisibility()
 	if controller.mainFrame then
 		controller.mainFrame.Visible = controller.mainGuiOpen
@@ -786,8 +1020,14 @@ local function refreshWindowVisibility()
 	if controller.notesFrame then
 		controller.notesFrame.Visible = controller.notesGuiOpen
 	end
+	if controller.blackenedChatFrame then
+		controller.blackenedChatFrame.Visible = controller.blackenedChatGuiOpen
+	end
 	if controller.notesToggleButton then
 		controller.notesToggleButton.Text = controller.notesGuiOpen and "Close Notes" or "Open Notes"
+	end
+	if controller.blackenedChatToggleButton then
+		controller.blackenedChatToggleButton.Text = controller.blackenedChatGuiOpen and "Close Says Log" or "Open Says Log"
 	end
 end
 
@@ -810,10 +1050,26 @@ local function hookGuiButtons()
 		end))
 	end
 
+	if controller.blackenedChatToggleButton then
+		table.insert(controller.uiConns, controller.blackenedChatToggleButton.MouseButton1Click:Connect(function()
+			controller.blackenedChatGuiOpen = not controller.blackenedChatGuiOpen
+			PERSIST.blackenedChatGuiOpen = controller.blackenedChatGuiOpen
+			refreshWindowVisibility()
+		end))
+	end
+
 	if controller.notesCloseBtn then
 		table.insert(controller.uiConns, controller.notesCloseBtn.MouseButton1Click:Connect(function()
 			controller.notesGuiOpen = false
 			PERSIST.notesGuiOpen = false
+			refreshWindowVisibility()
+		end))
+	end
+
+	if controller.blackenedChatCloseBtn then
+		table.insert(controller.uiConns, controller.blackenedChatCloseBtn.MouseButton1Click:Connect(function()
+			controller.blackenedChatGuiOpen = false
+			PERSIST.blackenedChatGuiOpen = false
 			refreshWindowVisibility()
 		end))
 	end
@@ -853,11 +1109,12 @@ local function ensureGui()
 
 	controller.gui = screen
 
-	local mainFrame, leaveList, leaveTitle, notesToggleButton, mainCloseBtn = makeMainGui(screen)
+	local mainFrame, leaveList, leaveTitle, notesToggleButton, blackenedChatToggleButton, mainCloseBtn = makeMainGui(screen)
 	controller.mainFrame = mainFrame
 	controller.leaveList = leaveList
 	controller.leaveTitle = leaveTitle
 	controller.notesToggleButton = notesToggleButton
+	controller.blackenedChatToggleButton = blackenedChatToggleButton
 	controller.mainCloseBtn = mainCloseBtn
 
 	local notesFrame, notesBox, notesCloseBtn = makeNotesGui(screen)
@@ -865,8 +1122,15 @@ local function ensureGui()
 	controller.notesBox = notesBox
 	controller.notesCloseBtn = notesCloseBtn
 
+	local blackenedChatFrame, blackenedChatList, blackenedChatTitle, blackenedChatCloseBtn = makeBlackenedChatGui(screen)
+	controller.blackenedChatFrame = blackenedChatFrame
+	controller.blackenedChatList = blackenedChatList
+	controller.blackenedChatTitle = blackenedChatTitle
+	controller.blackenedChatCloseBtn = blackenedChatCloseBtn
+
 	hookGuiButtons()
 	rebuildLeaveLogUI()
+	rebuildBlackenedChatUI()
 	applyNotesTextToBox()
 	refreshWindowVisibility()
 
@@ -984,11 +1248,384 @@ local function startTrail(plr)
 end
 
 --========================
+-- BLACKENED CHAT CAPTURE
+--========================
+local function isSlashCommand(msg)
+	return type(msg) == "string" and msg:sub(1, 1) == "/"
+end
+
+local function cleanText(s)
+	if type(s) ~= "string" then return "" end
+	return s:gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function pruneBlackenedSeen()
+	local now = os.clock()
+	for k, v in pairs(controller.blackenedSeen) do
+		if (now - v.t) > (GLOBAL_DEDUP_SECONDS + 1) then
+			controller.blackenedSeen[k] = nil
+		end
+	end
+end
+
+local function markBlackenedSeen(key, pr)
+	controller.blackenedSeen[key] = { t = os.clock(), pr = pr }
+end
+
+local function blockedByBlackenedKey(key, pr)
+	local now = os.clock()
+	local prev = controller.blackenedSeen[key]
+	if prev and (now - prev.t) <= GLOBAL_DEDUP_SECONDS then
+		if pr <= prev.pr then
+			return true
+		else
+			controller.blackenedSeen[key] = { t = now, pr = pr }
+			return false
+		end
+	end
+	return false
+end
+
+local function shouldLogBlackened(uid, text, priority)
+	pruneBlackenedSeen()
+	local speakerKey = tostring(uid or 0) .. "|" .. tostring(text or "")
+	local textKey = "TEXT|" .. tostring(text or "")
+
+	if DEDUPE_BY_TEXT_ONLY then
+		if blockedByBlackenedKey(textKey, priority) then
+			return false
+		end
+		markBlackenedSeen(textKey, priority)
+	end
+
+	if blockedByBlackenedKey(speakerKey, priority) then
+		return false
+	end
+	markBlackenedSeen(speakerKey, priority)
+	return true
+end
+
+local function logBlackenedTextFromPlayer(plr, text, priority)
+	if not plr or not plr:IsA("Player") then return end
+	text = cleanText(text)
+	if text == "" then return end
+
+	if PERSIST.currentBlackenedUserId == 0 then return end
+	if plr.UserId ~= PERSIST.currentBlackenedUserId then return end
+
+	if not shouldLogBlackened(plr.UserId, text, priority) then
+		return
+	end
+
+	addBlackenedChatEntry(text)
+	rebuildBlackenedChatUI()
+end
+
+local function resolvePlayerFromTextSource(textSource)
+	if not textSource then return nil end
+	local uid = textSource.UserId
+	if typeof(uid) == "number" then
+		return Players:GetPlayerByUserId(uid)
+	end
+	return nil
+end
+
+local function getPlayerFromSpeakerString(speaker)
+	if type(speaker) ~= "string" or speaker == "" then
+		return nil
+	end
+	local plr = Players:FindFirstChild(speaker)
+	if plr then return plr end
+	for _, candidate in ipairs(Players:GetPlayers()) do
+		if candidate.Name == speaker then
+			return candidate
+		end
+	end
+	return nil
+end
+
+local function getLabelTextRobust(lbl)
+	if not lbl then return "" end
+
+	local txt = ""
+	pcall(function()
+		txt = lbl.Text or ""
+	end)
+	txt = cleanText(txt)
+
+	local okContent, content = pcall(function()
+		return lbl.ContentText
+	end)
+	if okContent and type(content) == "string" then
+		local ct = cleanText(content)
+		if ct ~= "" then
+			return ct
+		end
+	end
+
+	return txt
+end
+
+local function findBillboardGui(inst)
+	local p = inst
+	for _ = 1, BUBBLE_MAX_PARENT_DEPTH do
+		if not p then return nil end
+		if p:IsA("BillboardGui") then return p end
+		p = p.Parent
+	end
+	return nil
+end
+
+local function isCharacterAdornee(bb)
+	if not (bb and bb.Adornee) then return false end
+	local model = bb.Adornee:FindFirstAncestorOfClass("Model")
+	if not model then return false end
+	local plr = Players:GetPlayerFromCharacter(model)
+	return plr ~= nil
+end
+
+local function isProbablyBubbleLabel(lbl)
+	if not (lbl and (lbl:IsA("TextLabel") or lbl:IsA("TextButton"))) then return false end
+
+	if controller.gui and lbl:IsDescendantOf(controller.gui) then
+		return false
+	end
+
+	local bb = findBillboardGui(lbl)
+	if bb and isCharacterAdornee(bb) then
+		return true
+	end
+
+	local p = lbl.Parent
+	local depth = 0
+	while p and depth < BUBBLE_MAX_PARENT_DEPTH do
+		local n = (p.Name or ""):lower()
+		if n:find("bubble") or n:find("bubblechat") or n:find("chatbubble") then
+			return true
+		end
+		if p:IsA("BillboardGui") and isCharacterAdornee(p) then
+			return true
+		end
+		p = p.Parent
+		depth += 1
+	end
+	return false
+end
+
+local function bubbleOwnerPlayer(lbl)
+	local bb = findBillboardGui(lbl)
+	if bb and bb.Adornee then
+		local model = bb.Adornee:FindFirstAncestorOfClass("Model")
+		if model then
+			return Players:GetPlayerFromCharacter(model)
+		end
+	end
+	return nil
+end
+
+local function handleBubbleLabel(lbl)
+	if not lbl or not lbl.Parent then return end
+	if not isProbablyBubbleLabel(lbl) then return end
+
+	local text = getLabelTextRobust(lbl)
+	if text == "" then return end
+	if IGNORE_BUBBLE_ELLIPSIS and text == "..." then return end
+	if FILTER_SLASH_IN_BUBBLES and isSlashCommand(text) then return end
+
+	local last = controller.blackenedLastTextByLabel[lbl]
+	if last == text then return end
+	controller.blackenedLastTextByLabel[lbl] = text
+
+	local plr = bubbleOwnerPlayer(lbl)
+	if not plr then return end
+
+	task.delay(BUBBLE_DELAY_SECONDS, function()
+		if not lbl.Parent then return end
+		local finalText = getLabelTextRobust(lbl)
+		if finalText == "" then return end
+		if IGNORE_BUBBLE_ELLIPSIS and finalText == "..." then return end
+		if FILTER_SLASH_IN_BUBBLES and isSlashCommand(finalText) then return end
+
+		controller.blackenedLastTextByLabel[lbl] = finalText
+		logBlackenedTextFromPlayer(plr, finalText, 1)
+	end)
+end
+
+local function scheduleLabelRetries(lbl)
+	if not (lbl and (lbl:IsA("TextLabel") or lbl:IsA("TextButton"))) then return end
+	if not lbl.Parent then return end
+
+	local tok = (controller.blackenedRetryTokenByLabel[lbl] or 0) + 1
+	controller.blackenedRetryTokenByLabel[lbl] = tok
+
+	for i = 1, BUBBLE_RETRY_PASSES do
+		task.delay(BUBBLE_RETRY_INTERVAL * i, function()
+			if not lbl.Parent then return end
+			if controller.blackenedRetryTokenByLabel[lbl] ~= tok then return end
+			pcall(function()
+				handleBubbleLabel(lbl)
+			end)
+		end)
+	end
+end
+
+local function hookBubbleLabel(lbl)
+	if not (lbl and (lbl:IsA("TextLabel") or lbl:IsA("TextButton"))) then return end
+	if controller.blackenedBubbleHooked[lbl] then
+		pcall(function()
+			handleBubbleLabel(lbl)
+		end)
+		scheduleLabelRetries(lbl)
+		return
+	end
+
+	controller.blackenedBubbleHooked[lbl] = true
+
+	pcall(function()
+		handleBubbleLabel(lbl)
+	end)
+	scheduleLabelRetries(lbl)
+
+	table.insert(controller.conns, lbl:GetPropertyChangedSignal("Text"):Connect(function()
+		pcall(function()
+			handleBubbleLabel(lbl)
+		end)
+		scheduleLabelRetries(lbl)
+	end))
+
+	pcall(function()
+		table.insert(controller.conns, lbl:GetPropertyChangedSignal("Visible"):Connect(function()
+			pcall(function()
+				handleBubbleLabel(lbl)
+			end)
+			scheduleLabelRetries(lbl)
+		end))
+	end)
+
+	table.insert(controller.conns, lbl.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			controller.blackenedLastTextByLabel[lbl] = nil
+			controller.blackenedBubbleHooked[lbl] = nil
+			controller.blackenedRetryTokenByLabel[lbl] = nil
+		else
+			pcall(function()
+				handleBubbleLabel(lbl)
+			end)
+			scheduleLabelRetries(lbl)
+		end
+	end))
+end
+
+local function hookBillboard(bb)
+	if not (bb and bb:IsA("BillboardGui")) then return end
+
+	for _, d in ipairs(bb:GetDescendants()) do
+		if d:IsA("TextLabel") or d:IsA("TextButton") then
+			hookBubbleLabel(d)
+		end
+	end
+
+	table.insert(controller.conns, bb.DescendantAdded:Connect(function(d)
+		if d:IsA("TextLabel") or d:IsA("TextButton") then
+			task.defer(function()
+				if d.Parent then
+					hookBubbleLabel(d)
+				end
+			end)
+		end
+	end))
+end
+
+local function scanAndWatchBubbleRoot(rootGui)
+	for _, d in ipairs(rootGui:GetDescendants()) do
+		if d:IsA("BillboardGui") then
+			hookBillboard(d)
+		elseif d:IsA("TextLabel") or d:IsA("TextButton") then
+			hookBubbleLabel(d)
+		end
+	end
+
+	table.insert(controller.conns, rootGui.DescendantAdded:Connect(function(d)
+		if d:IsA("BillboardGui") then
+			task.defer(function()
+				if d.Parent then
+					hookBillboard(d)
+				end
+			end)
+		elseif d:IsA("TextLabel") or d:IsA("TextButton") then
+			task.defer(function()
+				if d.Parent then
+					hookBubbleLabel(d)
+				end
+			end)
+		end
+	end))
+end
+
+local function setupBlackenedChatCapture()
+	if FORCE_BUBBLE_RANGE then
+		pcall(function()
+			local cfg = TextChatService:FindFirstChild("BubbleChatConfiguration")
+			if cfg then
+				cfg.Enabled = true
+				if cfg.MaxDistance ~= nil then cfg.MaxDistance = HUGE_DISTANCE end
+				if cfg.MinimizeDistance ~= nil then cfg.MinimizeDistance = HUGE_DISTANCE end
+			end
+		end)
+		pcall(function()
+			ChatService:SetBubbleChatSettings({
+				MaxDistance = HUGE_DISTANCE,
+				MinimizeDistance = HUGE_DISTANCE,
+			})
+		end)
+	end
+
+	local events = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+	if events then
+		local msgEvent = events:FindFirstChild("OnMessageDoneFiltering")
+		if msgEvent and msgEvent:IsA("RemoteEvent") then
+			connect(msgEvent.OnClientEvent, function(messageData)
+				local text = cleanText(messageData and (messageData.Message or messageData.MessageText) or "")
+				if text == "" then return end
+				if FILTER_SLASH_IN_CHAT and isSlashCommand(text) then return end
+
+				local speaker = messageData.FromSpeaker or messageData.SpeakerName or "Unknown"
+				local plr = getPlayerFromSpeakerString(speaker)
+				if plr then
+					logBlackenedTextFromPlayer(plr, text, 2)
+				end
+			end)
+		end
+	end
+
+	if TextChatService and TextChatService.MessageReceived then
+		connect(TextChatService.MessageReceived, function(message)
+			local text = cleanText(message.Text or "")
+			if text == "" then return end
+			if FILTER_SLASH_IN_CHAT and isSlashCommand(text) then return end
+
+			local source = message.TextSource
+			local plr = resolvePlayerFromTextSource(source)
+			if plr then
+				logBlackenedTextFromPlayer(plr, text, 2)
+			end
+		end)
+	end
+
+	scanAndWatchBubbleRoot(CoreGui)
+	local playerGui = getPlayerGuiSafe()
+	if playerGui then
+		scanAndWatchBubbleRoot(playerGui)
+	end
+end
+
+--========================
 -- PLAYER WATCHING
 --========================
 local function watchPlayer(plr)
 	if controller.perPlayerConns[plr] then return end
 	controller.perPlayerConns[plr] = {}
+	controller.playerBlackenedState[plr] = playerHasBlackened(plr)
 
 	local function pconnect(sig, fn)
 		local c = sig:Connect(fn)
@@ -1003,6 +1640,15 @@ local function watchPlayer(plr)
 	pconnect(plr.ChildAdded, function(child)
 		if child.Name == TARGET_NAME then
 			startTrail(plr)
+			controller.playerBlackenedState[plr] = true
+			setCurrentBlackened(plr)
+			rebuildBlackenedChatUI()
+		end
+	end)
+
+	pconnect(plr.ChildRemoved, function(child)
+		if child.Name == TARGET_NAME then
+			controller.playerBlackenedState[plr] = playerHasBlackened(plr)
 		end
 	end)
 end
@@ -1013,6 +1659,7 @@ local function unwatchPlayer(plr)
 		disconnectList(list)
 	end
 	controller.perPlayerConns[plr] = nil
+	controller.playerBlackenedState[plr] = nil
 end
 
 --========================
@@ -1043,26 +1690,72 @@ end)
 Players.PlayerRemoving:Connect(function(plr)
 	addLeaveLog(plr)
 	rebuildLeaveLogUI()
+
 	stopTrail(plr)
 	unwatchPlayer(plr)
+
+	if PERSIST.currentBlackenedUserId == plr.UserId then
+		setCurrentBlackened(findCurrentBlackenedPlayer())
+		rebuildBlackenedChatUI()
+	end
 end)
 
 --========================
--- GUI WATCHDOG
+-- WATCHDOGS / SCAN
 --========================
 local accumGui = 0
+local accumState = 0
 
 connect(RunService.Heartbeat, function(dt)
 	accumGui += dt
+	accumState += dt
+
 	if accumGui >= GUI_WATCHDOG_INTERVAL then
 		accumGui = 0
 		if not isGuiAlive() then
 			ensureGui()
 			rebuildLeaveLogUI()
+			rebuildBlackenedChatUI()
 			applyNotesTextToBox()
 			refreshWindowVisibility()
 		else
 			refreshWindowVisibility()
+		end
+	end
+
+	if accumState >= STATE_SCAN_INTERVAL then
+		accumState = 0
+
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local hb = playerHasBlackened(plr)
+			local old = controller.playerBlackenedState[plr]
+
+			if old == nil then
+				controller.playerBlackenedState[plr] = hb
+				if hb then
+					startTrail(plr)
+				end
+			else
+				if (old == false) and hb == true then
+					startTrail(plr)
+					setCurrentBlackened(plr)
+					rebuildBlackenedChatUI()
+				end
+				controller.playerBlackenedState[plr] = hb
+			end
+		end
+
+		local current = findCurrentBlackenedPlayer()
+		if current then
+			if PERSIST.currentBlackenedUserId ~= current.UserId then
+				setCurrentBlackened(current)
+				rebuildBlackenedChatUI()
+			end
+		else
+			if PERSIST.currentBlackenedUserId ~= 0 then
+				setCurrentBlackened(nil)
+				rebuildBlackenedChatUI()
+			end
 		end
 	end
 end)
@@ -1073,6 +1766,14 @@ end)
 ensureGui()
 rebuildLeaveLogUI()
 applyNotesTextToBox()
+
+local startupBlackened = findCurrentBlackenedPlayer()
+if startupBlackened then
+	setCurrentBlackened(startupBlackened)
+end
+rebuildBlackenedChatUI()
 refreshWindowVisibility()
 
-print("[BlackenedTrailTracker] Loaded. L toggles leave log GUI. Notes strip repeated visible timestamps so old lines keep their original time.")
+setupBlackenedChatCapture()
+
+print("[BlackenedTrailTracker] Loaded. L toggles leave log GUI. Notes are separate. Blackened Says logs only the current Blackened and resets when a new Blackened appears.")
