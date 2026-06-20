@@ -27,6 +27,10 @@ do
     local MAX_LINES = 500
     local MATCH_WINDOW = 4
     local actualChat = {}
+    local nextUnknownId = 0
+    local unknownByColor = {}
+    local unknownAssignments = {}
+    local rowsByUnknown = {}
 
     local function connect(signal, callback)
         local connection = signal:Connect(callback)
@@ -234,6 +238,181 @@ do
     layout.Padding = UDim.new(0, 6)
     layout.Parent = scroll
 
+    -- Assignment picker ---------------------------------------------------
+    local picker = Instance.new("Frame")
+    picker.Name = "AssignmentPicker"
+    picker.AnchorPoint = Vector2.new(0.5, 0.5)
+    picker.Position = UDim2.fromScale(0.5, 0.53)
+    picker.Size = UDim2.fromOffset(330, 280)
+    picker.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+    picker.BorderSizePixel = 0
+    picker.Visible = false
+    picker.ZIndex = 20
+    picker.Parent = frame
+
+    local pickerCorner = Instance.new("UICorner")
+    pickerCorner.CornerRadius = UDim.new(0, 10)
+    pickerCorner.Parent = picker
+
+    local pickerStroke = Instance.new("UIStroke")
+    pickerStroke.Color = Color3.fromRGB(90, 90, 105)
+    pickerStroke.Thickness = 1
+    pickerStroke.Parent = picker
+
+    local pickerTitle = Instance.new("TextLabel")
+    pickerTitle.Size = UDim2.new(1, -48, 0, 38)
+    pickerTitle.Position = UDim2.fromOffset(12, 0)
+    pickerTitle.BackgroundTransparency = 1
+    pickerTitle.Font = Enum.Font.GothamBold
+    pickerTitle.TextSize = 14
+    pickerTitle.TextColor3 = Color3.fromRGB(240, 240, 245)
+    pickerTitle.TextXAlignment = Enum.TextXAlignment.Left
+    pickerTitle.ZIndex = 21
+    pickerTitle.Parent = picker
+
+    local pickerClose = Instance.new("TextButton")
+    pickerClose.Size = UDim2.fromOffset(28, 26)
+    pickerClose.Position = UDim2.new(1, -36, 0, 6)
+    pickerClose.BackgroundColor3 = Color3.fromRGB(58, 35, 38)
+    pickerClose.BorderSizePixel = 0
+    pickerClose.Font = Enum.Font.GothamBold
+    pickerClose.TextSize = 13
+    pickerClose.TextColor3 = Color3.fromRGB(245, 245, 245)
+    pickerClose.Text = "X"
+    pickerClose.ZIndex = 21
+    pickerClose.Parent = picker
+
+    local pickerCloseCorner = Instance.new("UICorner")
+    pickerCloseCorner.CornerRadius = UDim.new(0, 6)
+    pickerCloseCorner.Parent = pickerClose
+
+    local playerList = Instance.new("ScrollingFrame")
+    playerList.Size = UDim2.new(1, -20, 1, -48)
+    playerList.Position = UDim2.fromOffset(10, 40)
+    playerList.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    playerList.BorderSizePixel = 0
+    playerList.ScrollBarThickness = 7
+    playerList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    playerList.CanvasSize = UDim2.fromOffset(0, 0)
+    playerList.ZIndex = 21
+    playerList.Parent = picker
+
+    local playerListCorner = Instance.new("UICorner")
+    playerListCorner.CornerRadius = UDim.new(0, 7)
+    playerListCorner.Parent = playerList
+
+    local playerListPadding = Instance.new("UIPadding")
+    playerListPadding.PaddingTop = UDim.new(0, 7)
+    playerListPadding.PaddingBottom = UDim.new(0, 7)
+    playerListPadding.PaddingLeft = UDim.new(0, 7)
+    playerListPadding.PaddingRight = UDim.new(0, 7)
+    playerListPadding.Parent = playerList
+
+    local playerListLayout = Instance.new("UIListLayout")
+    playerListLayout.Padding = UDim.new(0, 5)
+    playerListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    playerListLayout.Parent = playerList
+
+    local function colorFingerprint(color)
+        if typeof(color) ~= "Color3" then
+            return nil
+        end
+        return string.format(
+            "%d,%d,%d",
+            math.floor(color.R * 255 + 0.5),
+            math.floor(color.G * 255 + 0.5),
+            math.floor(color.B * 255 + 0.5)
+        )
+    end
+
+    local function findUnknownId(color)
+        local fingerprint = colorFingerprint(color)
+        return fingerprint and unknownByColor[fingerprint] or nil
+    end
+
+    local function getUnknownId(color)
+        local fingerprint = colorFingerprint(color)
+        if fingerprint and unknownByColor[fingerprint] then
+            return unknownByColor[fingerprint]
+        end
+
+        nextUnknownId = nextUnknownId + 1
+        local unknownId = nextUnknownId
+        if fingerprint then
+            unknownByColor[fingerprint] = unknownId
+        end
+        return unknownId
+    end
+
+    local function renderRow(row)
+        if row.button and row.button.Parent then
+            row.button.Text = row.name .. ": " .. row.text
+        end
+    end
+
+    local function assignUnknown(unknownId, playerName)
+        unknownAssignments[unknownId] = playerName
+        for _, row in ipairs(rowsByUnknown[unknownId] or {}) do
+            row.name = playerName
+            renderRow(row)
+        end
+    end
+
+    local function clearPlayerButtons()
+        for _, child in ipairs(playerList:GetChildren()) do
+            if child:IsA("TextButton") then
+                child:Destroy()
+            end
+        end
+    end
+
+    local function openPicker(unknownId)
+        clearPlayerButtons()
+        pickerTitle.Text = "Assign Unknown" .. tostring(unknownId)
+
+        local players = Players:GetPlayers()
+        table.sort(players, function(a, b)
+            return string.lower(a.Name) < string.lower(b.Name)
+        end)
+
+        for order, player in ipairs(players) do
+            local button = Instance.new("TextButton")
+            button.Name = "PlayerOption"
+            button.Size = UDim2.new(1, -4, 0, 34)
+            button.BackgroundColor3 = Color3.fromRGB(38, 38, 46)
+            button.BorderSizePixel = 0
+            button.Font = Enum.Font.Gotham
+            button.TextSize = 13
+            button.TextColor3 = Color3.fromRGB(240, 240, 245)
+            button.TextXAlignment = Enum.TextXAlignment.Left
+            button.LayoutOrder = order
+            button.ZIndex = 22
+
+            if player.DisplayName ~= player.Name then
+                button.Text = "   " .. player.DisplayName .. "  (@" .. player.Name .. ")"
+            else
+                button.Text = "   " .. player.Name
+            end
+            button.Parent = playerList
+
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 6)
+            corner.Parent = button
+
+            connect(button.MouseButton1Click, function()
+                assignUnknown(unknownId, player.Name)
+                picker.Visible = false
+            end)
+        end
+
+        playerList.CanvasPosition = Vector2.zero
+        picker.Visible = true
+    end
+
+    connect(pickerClose.MouseButton1Click, function()
+        picker.Visible = false
+    end)
+
     local function isNearBottom()
         local maxY = math.max(0, scroll.AbsoluteCanvasSize.Y - scroll.AbsoluteWindowSize.Y)
         return maxY - scroll.CanvasPosition.Y <= 28
@@ -249,7 +428,23 @@ do
         end)
     end
 
-    local function addLine(name, text, color)
+    local function removeRowFromUnknownGroup(row)
+        if not row.unknownId then
+            return
+        end
+        local group = rowsByUnknown[row.unknownId]
+        if not group then
+            return
+        end
+        for index = #group, 1, -1 do
+            if group[index] == row then
+                table.remove(group, index)
+                break
+            end
+        end
+    end
+
+    local function addLine(name, text, color, unknownId)
         if not running or type(text) ~= "string" then
             return
         end
@@ -260,12 +455,9 @@ do
         end
 
         name = type(name) == "string" and name ~= "" and name or "Unknown"
-        local renderedText = name .. ": " .. text
-
         local stickToBottom = isNearBottom()
-        history[#history + 1] = renderedText
 
-        local line = Instance.new("TextLabel")
+        local line = Instance.new("TextButton")
         line.Name = "Line"
         line.Size = UDim2.new(1, -6, 0, 24)
         line.AutomaticSize = Enum.AutomaticSize.Y
@@ -278,8 +470,28 @@ do
         line.TextXAlignment = Enum.TextXAlignment.Left
         line.TextYAlignment = Enum.TextYAlignment.Top
         line.TextWrapped = true
-        line.Text = renderedText
+        line.AutoButtonColor = unknownId ~= nil
         line.Parent = scroll
+
+        local row = {
+            button = line,
+            name = name,
+            text = text,
+            unknownId = unknownId,
+        }
+        history[#history + 1] = row
+        renderRow(row)
+
+        if unknownId then
+            rowsByUnknown[unknownId] = rowsByUnknown[unknownId] or {}
+            rowsByUnknown[unknownId][#rowsByUnknown[unknownId] + 1] = row
+            connect(line.MouseButton1Click, function()
+                openPicker(unknownId)
+            end)
+        else
+            line.Active = false
+            line.Selectable = false
+        end
 
         local linePadding = Instance.new("UIPadding")
         linePadding.PaddingTop = UDim.new(0, 6)
@@ -292,19 +504,12 @@ do
         lineCorner.CornerRadius = UDim.new(0, 8)
         lineCorner.Parent = line
 
-        local lines = {}
-        for _, child in ipairs(scroll:GetChildren()) do
-            if child:IsA("TextLabel") and child.Name == "Line" then
-                lines[#lines + 1] = child
+        while #history > MAX_LINES do
+            local removed = table.remove(history, 1)
+            removeRowFromUnknownGroup(removed)
+            if removed.button and removed.button.Parent then
+                removed.button:Destroy()
             end
-        end
-        while #lines > MAX_LINES do
-            lines[1]:Destroy()
-            table.remove(lines, 1)
-        end
-
-        if #history > MAX_LINES then
-            table.remove(history, 1)
         end
 
         if stickToBottom then
@@ -374,7 +579,26 @@ do
         -- Give the real chat event a moment to arrive if WhiteNoise fires first.
         task.delay(0.25, function()
             if running then
-                addLine(findMatchingName(text), text, color)
+                local name = findMatchingName(text)
+                local unknownId = findUnknownId(color)
+                local unresolved = false
+
+                if name == "Unknown" then
+                    unknownId = unknownId or getUnknownId(color)
+                    local assignedName = unknownAssignments[unknownId]
+                    if assignedName then
+                        name = assignedName
+                    else
+                        name = "Unknown" .. tostring(unknownId)
+                        unresolved = true
+                    end
+                elseif unknownId then
+                    -- A later real-chat match can automatically resolve older
+                    -- lines that shared this WhiteNoise color.
+                    assignUnknown(unknownId, name)
+                end
+
+                addLine(name, text, color, unresolved and unknownId or nil)
             end
         end)
     end)
@@ -391,7 +615,11 @@ do
     end)
 
     connect(copyButton.MouseButton1Click, function()
-        local payload = table.concat(history, "\n")
+        local output = table.create(#history)
+        for index, row in ipairs(history) do
+            output[index] = row.name .. ": " .. row.text
+        end
+        local payload = table.concat(output, "\n")
         local environment = (getgenv and getgenv()) or _G
         local clipboard = rawget(environment, "setclipboard") or rawget(environment, "toclipboard")
 
