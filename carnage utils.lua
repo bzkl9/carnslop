@@ -9,12 +9,18 @@ if not LOCAL_PLAYER then return end
 
 local TARGET_NAME = "Blackened"
 local TRAIL_DURATION = 7 * 60
-local HISTORY_DURATION = 7 * 60
 local HISTORY_INTERVAL = 1
 local MIN_STEP_DISTANCE = 1.5
 local RAYCAST_DISTANCE = 50
-local MARKER_SIZE = Vector3.new(1, 0.2, 1)
-local MARKER_COLOR = Color3.fromRGB(130, 0, 130)
+local ARROW_SIZE = Vector3.new(3.4, 0.05, 3.4)
+local BLACKENED_MARKER_COLOR = Color3.fromRGB(255, 70, 70)
+local BLACKENED_NUMBER_COLOR = Color3.fromRGB(0, 0, 0)
+local VICTIM_MARKER_COLOR = Color3.fromRGB(0, 190, 255)
+local VICTIM_NUMBER_COLOR = Color3.fromRGB(255, 255, 255)
+local DECEASED_POLL_INTERVAL = 1
+local FLOW_UPDATE_INTERVAL = 0.1
+local FLOW_SPEED = 5
+local FLOW_SPACING = 0.7
 local TOGGLE_KEY = Enum.KeyCode.L
 local GUI_NAME = "BlackenedTrailTrackerGui"
 local LEAVE_LOG_MAX = 120
@@ -37,10 +43,13 @@ if _G.BlackenedTrailTrackerController and type(_G.BlackenedTrailTrackerControlle
 end
 
 local controller = {
+	running = true,
 	conns = {},
 	perPlayerConns = {},
 	histories = {},
 	activeTrails = {},
+	victimTrails = {},
+	deceasedSeen = {},
 	playerBlackenedState = {},
 	currentBlackenedUserId = 0,
 	gui = nil,
@@ -89,7 +98,30 @@ local function stopAllTrails()
 	end
 end
 
+local function stopVictimTrail(userId)
+	local data = controller.victimTrails[userId]
+	if not data then return end
+	data.running = false
+	if data.folder then
+		pcall(function()
+			data.folder:Destroy()
+		end)
+	end
+	controller.victimTrails[userId] = nil
+end
+
+local function stopAllVictimTrails()
+	local userIds = {}
+	for userId in pairs(controller.victimTrails) do
+		table.insert(userIds, userId)
+	end
+	for _, userId in ipairs(userIds) do
+		stopVictimTrail(userId)
+	end
+end
+
 local function cleanup()
+	controller.running = false
 	disconnectList(controller.conns)
 	controller.conns = {}
 	for _, list in pairs(controller.perPlayerConns) do
@@ -97,6 +129,7 @@ local function cleanup()
 	end
 	controller.perPlayerConns = {}
 	stopAllTrails()
+	stopAllVictimTrails()
 	if controller.gui then
 		pcall(function()
 			controller.gui:Destroy()
@@ -443,36 +476,57 @@ local function samplePlayer(player)
 		})
 		history.nextId += 1
 	end
-	local cutoff = now - HISTORY_DURATION
-	while points[1] and points[1].t < cutoff do
-		table.remove(points, 1)
-	end
 end
 
-local function createMarker(parent, position, index)
+local function createArrow(parent, position, targetPosition, index, markerColor, numberColor)
+	local direction = Vector3.new(targetPosition.X - position.X, 0, targetPosition.Z - position.Z)
+	if direction.Magnitude < 0.05 then return nil end
+	direction = direction.Unit
 	local part = Instance.new("Part")
 	part.Anchored = true
 	part.CanCollide = false
 	part.CanQuery = false
 	part.CanTouch = false
-	part.Size = MARKER_SIZE
-	part.Material = Enum.Material.Neon
-	part.Color = MARKER_COLOR
-	part.CFrame = CFrame.new(position)
+	part.Transparency = 1
+	part.Size = ARROW_SIZE
+	part.CFrame = CFrame.fromMatrix(position, direction, Vector3.new(0, 1, 0), direction:Cross(Vector3.new(0, 1, 0)))
 	part.Parent = parent
+	local surface = Instance.new("SurfaceGui")
+	surface.Face = Enum.NormalId.Top
+	surface.CanvasSize = Vector2.new(160, 160)
+	surface.AlwaysOnTop = false
+	surface.LightInfluence = 0
+	surface.Parent = part
+	local arrow = Instance.new("TextLabel")
+	arrow.BackgroundTransparency = 1
+	arrow.Size = UDim2.new(1, 0, 1, 0)
+	arrow.Text = utf8.char(10148)
+	arrow.TextScaled = true
+	arrow.Font = Enum.Font.GothamBold
+	arrow.TextColor3 = markerColor
+	arrow.TextStrokeColor3 = Color3.fromRGB(255, 255, 255)
+	arrow.TextStrokeTransparency = 0.65
+	arrow.TextTransparency = 0.12
+	arrow.Parent = surface
 	local billboard = Instance.new("BillboardGui")
 	billboard.Size = UDim2.new(0, 36, 0, 36)
 	billboard.StudsOffset = Vector3.new(0, 1.5, 0)
 	billboard.AlwaysOnTop = true
 	billboard.Parent = part
-	local label = Instance.new("TextLabel")
-	label.BackgroundTransparency = 1
-	label.Size = UDim2.new(1, 0, 1, 0)
-	label.Text = tostring(index)
-	label.TextScaled = true
-	label.Font = Enum.Font.SourceSansBold
-	label.TextColor3 = Color3.new(1, 1, 1)
-	label.Parent = billboard
+	local number = Instance.new("TextLabel")
+	number.BackgroundTransparency = 1
+	number.Size = UDim2.new(1, 0, 1, 0)
+	number.Text = tostring(index)
+	number.TextScaled = true
+	number.Font = Enum.Font.SourceSansBold
+	number.TextColor3 = numberColor
+	number.TextStrokeColor3 = markerColor
+	number.TextStrokeTransparency = 0.35
+	number.Parent = billboard
+	return {
+		arrow = arrow,
+		number = number,
+	}
 end
 
 local function startTrail(player)
@@ -488,24 +542,34 @@ local function startTrail(player)
 	local data = {
 		running = true,
 		folder = folder,
+		visuals = {},
 	}
 	controller.activeTrails[player.UserId] = data
 	controller.currentBlackenedUserId = player.UserId
 	task.spawn(function()
 		local startedAt = os.clock()
 		local lastRenderedId = 0
-		local markerNumber = 0
+		local arrowNumber = 0
 		local initialPoints = {}
 		for _, point in ipairs(ensureHistory(player).points) do
 			table.insert(initialPoints, point)
 		end
-		for _, point in ipairs(initialPoints) do
+		local lastPoint = initialPoints[1]
+		if lastPoint then
+			lastRenderedId = lastPoint.id
+		end
+		for index = 2, #initialPoints do
 			if not data.running or not playerHasBlackened(player) then break end
-			markerNumber += 1
-			local floorPosition = raycastFloor(player.Character, point.position)
-			createMarker(folder, floorPosition, markerNumber)
+			local point = initialPoints[index]
+			arrowNumber += 1
+			local floorPosition = raycastFloor(player.Character, lastPoint.position)
+			local visual = createArrow(folder, floorPosition, point.position, arrowNumber, BLACKENED_MARKER_COLOR, BLACKENED_NUMBER_COLOR)
+			if visual then
+				table.insert(data.visuals, visual)
+			end
+			lastPoint = point
 			lastRenderedId = point.id
-			if markerNumber % 30 == 0 then
+			if arrowNumber % 30 == 0 then
 				task.wait()
 			end
 		end
@@ -516,11 +580,17 @@ local function startTrail(player)
 			for _, point in ipairs(history.points) do
 				if not data.running then break end
 				if point.id > lastRenderedId then
-					markerNumber += 1
-					local floorPosition = raycastFloor(player.Character, point.position)
-					createMarker(folder, floorPosition, markerNumber)
+					if lastPoint then
+						arrowNumber += 1
+						local floorPosition = raycastFloor(player.Character, lastPoint.position)
+						local visual = createArrow(folder, floorPosition, point.position, arrowNumber, BLACKENED_MARKER_COLOR, BLACKENED_NUMBER_COLOR)
+						if visual then
+							table.insert(data.visuals, visual)
+						end
+					end
+					lastPoint = point
 					lastRenderedId = point.id
-					if markerNumber % 30 == 0 then
+					if arrowNumber > 0 and arrowNumber % 30 == 0 then
 						task.wait()
 					end
 				end
@@ -528,6 +598,97 @@ local function startTrail(player)
 			task.wait(0.1)
 		end
 		stopTrailByUserId(player.UserId)
+	end)
+end
+
+local function startVictimTrail(userId)
+	if controller.victimTrails[userId] then return end
+	local history = controller.histories[userId]
+	if not history or #history.points == 0 then return end
+	local player = Players:GetPlayerByUserId(userId)
+	local folder = Instance.new("Folder")
+	folder.Name = "VictimTrail_" .. (player and player.Name or tostring(userId)) .. "_" .. os.time()
+	folder.Parent = workspace
+	local data = {
+		running = true,
+		folder = folder,
+		visuals = {},
+	}
+	controller.victimTrails[userId] = data
+	local points = {}
+	for _, point in ipairs(history.points) do
+		table.insert(points, point)
+	end
+	task.spawn(function()
+		local startedAt = os.clock()
+		for index = 1, #points - 1 do
+			if not data.running then break end
+			local point = points[index]
+			local nextPoint = points[index + 1]
+			local currentPlayer = Players:GetPlayerByUserId(userId)
+			local character = currentPlayer and currentPlayer.Character or nil
+			local floorPosition = raycastFloor(character, point.position)
+			local visual = createArrow(folder, floorPosition, nextPoint.position, index, VICTIM_MARKER_COLOR, VICTIM_NUMBER_COLOR)
+			if visual then
+				table.insert(data.visuals, visual)
+			end
+			if index % 30 == 0 then
+				task.wait()
+			end
+		end
+		local remaining = TRAIL_DURATION - (os.clock() - startedAt)
+		if data.running and remaining > 0 then
+			task.wait(remaining)
+		end
+		stopVictimTrail(userId)
+	end)
+end
+
+local function getDeceasedEvent()
+	local events = ReplicatedStorage:FindFirstChild("Events")
+	local getAll = events and events:FindFirstChild("GetAll")
+	local event = getAll and getAll:FindFirstChild("GetDeceased")
+	if event and event:IsA("RemoteFunction") then
+		return event
+	end
+	return nil
+end
+
+local function revealVictim(userId)
+	userId = tonumber(userId)
+	if not userId or userId <= 0 or controller.deceasedSeen[userId] then return end
+	controller.deceasedSeen[userId] = true
+	startVictimTrail(userId)
+end
+
+local function processDeceasedResult(result)
+	if type(result) ~= "table" then return end
+	if type(result[1]) == "table" then
+		for _, record in ipairs(result) do
+			if type(record) == "table" then
+				revealVictim(record[2])
+			end
+		end
+	else
+		revealVictim(result[2])
+	end
+end
+
+local function startDeceasedPolling()
+	task.spawn(function()
+		while controller.running do
+			local event = getDeceasedEvent()
+			if event then
+				local ok, result = pcall(function()
+					return event:InvokeServer()
+				end)
+				if not controller.running then break end
+				if ok then
+					processDeceasedResult(result)
+				end
+			end
+			task.wait(DECEASED_POLL_INTERVAL)
+		end
 	end)
 end
 
@@ -582,7 +743,6 @@ local function unwatchPlayer(player)
 	disconnectList(controller.perPlayerConns[player])
 	controller.perPlayerConns[player] = nil
 	controller.playerBlackenedState[player] = nil
-	controller.histories[player.UserId] = nil
 end
 
 connect(UserInputService.InputBegan, function(input, gameProcessed)
@@ -617,14 +777,38 @@ connect(Players.PlayerRemoving, function(player)
 	end
 end)
 
+local function updateFlow(collection, now)
+	for _, data in pairs(collection) do
+		if data.running and data.visuals then
+			for index, visual in ipairs(data.visuals) do
+				local arrow = visual.arrow
+				if arrow and arrow.Parent then
+					local wave = (math.sin(now * FLOW_SPEED - index * FLOW_SPACING) + 1) * 0.5
+					local pulse = wave ^ 5
+					arrow.TextTransparency = 0.42 - pulse * 0.36
+					arrow.TextStrokeTransparency = 0.86 - pulse * 0.56
+				end
+			end
+		end
+	end
+end
+
 local historyAccumulator = 0
 local guiAccumulator = 0
 local stateAccumulator = 0
+local flowAccumulator = 0
 
 connect(RunService.Heartbeat, function(deltaTime)
 	historyAccumulator += deltaTime
 	guiAccumulator += deltaTime
 	stateAccumulator += deltaTime
+	flowAccumulator += deltaTime
+	if flowAccumulator >= FLOW_UPDATE_INTERVAL then
+		flowAccumulator %= FLOW_UPDATE_INTERVAL
+		local now = os.clock()
+		updateFlow(controller.activeTrails, now)
+		updateFlow(controller.victimTrails, now)
+	end
 	if historyAccumulator >= HISTORY_INTERVAL then
 		historyAccumulator %= HISTORY_INTERVAL
 		for _, player in ipairs(Players:GetPlayers()) do
@@ -659,5 +843,6 @@ end)
 ensureGui()
 rebuildLeaveLogUI()
 activateCurrentBlackened(findCurrentBlackenedPlayer())
+startDeceasedPolling()
 
-print("[BlackenedTrailTracker] Loaded. Everyone is tracked invisibly; only the Blackened trail is shown. L toggles the leave log.")
+print("[BlackenedTrailTracker] Loaded. Animated red arrows show the Blackened path, cyan arrows show deceased paths, and L toggles the leave log.")
