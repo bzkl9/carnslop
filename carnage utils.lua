@@ -9,7 +9,7 @@ if not LOCAL_PLAYER then return end
 
 local TARGET_NAME = "Blackened"
 local TRAIL_DURATION = 7 * 60
-local HISTORY_INTERVAL = 1
+local HISTORY_INTERVAL = 2.5
 local MIN_STEP_DISTANCE = 1.5
 local RAYCAST_DISTANCE = 50
 local ARROW_SIZE = Vector3.new(3.4, 0.05, 3.4)
@@ -17,7 +17,6 @@ local BLACKENED_MARKER_COLOR = Color3.fromRGB(255, 70, 70)
 local BLACKENED_NUMBER_COLOR = Color3.fromRGB(0, 0, 0)
 local VICTIM_MARKER_COLOR = Color3.fromRGB(0, 190, 255)
 local VICTIM_NUMBER_COLOR = Color3.fromRGB(255, 255, 255)
-local DECEASED_POLL_INTERVAL = 1
 local FLOW_UPDATE_INTERVAL = 0.1
 local FLOW_SPEED = 5
 local FLOW_SPACING = 0.7
@@ -50,6 +49,7 @@ local controller = {
 	activeTrails = {},
 	victimTrails = {},
 	deceasedSeen = {},
+	userIdsByName = {},
 	playerBlackenedState = {},
 	currentBlackenedUserId = 0,
 	gui = nil,
@@ -644,16 +644,6 @@ local function startVictimTrail(userId)
 	end)
 end
 
-local function getDeceasedEvent()
-	local events = ReplicatedStorage:FindFirstChild("Events")
-	local getAll = events and events:FindFirstChild("GetAll")
-	local event = getAll and getAll:FindFirstChild("GetDeceased")
-	if event and event:IsA("RemoteFunction") then
-		return event
-	end
-	return nil
-end
-
 local function revealVictim(userId)
 	userId = tonumber(userId)
 	if not userId or userId <= 0 or controller.deceasedSeen[userId] then return end
@@ -661,34 +651,69 @@ local function revealVictim(userId)
 	startVictimTrail(userId)
 end
 
-local function processDeceasedResult(result)
-	if type(result) ~= "table" then return end
-	if type(result[1]) == "table" then
-		for _, record in ipairs(result) do
-			if type(record) == "table" then
-				revealVictim(record[2])
+local function resolveVictimUserId(value, depth)
+	depth = depth or 0
+	if depth > 3 then return nil end
+	local valueType = typeof(value)
+	if valueType == "number" then
+		return value > 0 and value or nil
+	end
+	if valueType == "string" then
+		local player = Players:FindFirstChild(value)
+		if player and player:IsA("Player") then
+			return player.UserId
+		end
+		return controller.userIdsByName[value] or controller.userIdsByName[string.lower(value)]
+	end
+	if valueType == "Instance" then
+		if value:IsA("Player") then
+			return value.UserId
+		end
+		local character = value:IsA("Model") and value or value:FindFirstAncestorOfClass("Model")
+		local player = character and Players:GetPlayerFromCharacter(character) or nil
+		if player then
+			return player.UserId
+		end
+		return resolveVictimUserId(character and character.Name or value.Name, depth + 1)
+	end
+	if valueType == "table" then
+		local keys = {
+			"Victim", "victim", "DeadPlayer", "deadPlayer", "Player", "player",
+			"Character", "character", "UserId", "userId", "Name", "name",
+		}
+		for _, key in ipairs(keys) do
+			if value[key] ~= nil then
+				local userId = resolveVictimUserId(value[key], depth + 1)
+				if userId then return userId end
 			end
 		end
-	else
-		revealVictim(result[2])
+		if value[2] ~= nil then
+			local userId = resolveVictimUserId(value[2], depth + 1)
+			if userId then return userId end
+		end
+		if value[1] ~= nil then
+			return resolveVictimUserId(value[1], depth + 1)
+		end
 	end
+	return nil
 end
 
-local function startDeceasedPolling()
+local function startDeathEventListening()
 	task.spawn(function()
-		while controller.running do
-			local event = getDeceasedEvent()
-			if event then
-				local ok, result = pcall(function()
-					return event:InvokeServer()
-				end)
-				if not controller.running then break end
-				if ok then
-					processDeceasedResult(result)
+		local events = ReplicatedStorage:WaitForChild("Events", 30)
+		if not events or not controller.running then return end
+		local event = events:WaitForChild("PlayerHasDiedEvent", 30)
+		if not event or not event:IsA("RemoteEvent") or not controller.running then return end
+		connect(event.OnClientEvent, function(...)
+			local args = table.pack(...)
+			for index = args.n, 1, -1 do
+				local userId = resolveVictimUserId(args[index])
+				if userId then
+					revealVictim(userId)
+					return
 				end
 			end
-			task.wait(DECEASED_POLL_INTERVAL)
-		end
+		end)
 	end)
 end
 
@@ -716,6 +741,8 @@ local function watchPlayer(player)
 	if controller.perPlayerConns[player] then return end
 	controller.perPlayerConns[player] = {}
 	controller.playerBlackenedState[player] = playerHasBlackened(player)
+	controller.userIdsByName[player.Name] = player.UserId
+	controller.userIdsByName[string.lower(player.Name)] = player.UserId
 	ensureHistory(player)
 	local function pconnect(signal, callback)
 		local connection = signal:Connect(callback)
@@ -843,6 +870,6 @@ end)
 ensureGui()
 rebuildLeaveLogUI()
 activateCurrentBlackened(findCurrentBlackenedPlayer())
-startDeceasedPolling()
+startDeathEventListening()
 
-print("[BlackenedTrailTracker] Loaded. Animated red arrows show the Blackened path, cyan arrows show deceased paths, and L toggles the leave log.")
+print("[BlackenedTrailTracker] Loaded. PlayerHasDiedEvent reveals cyan victim paths, red arrows show the Blackened path, and L toggles the leave log.")
