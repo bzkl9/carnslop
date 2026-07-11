@@ -9,7 +9,7 @@ if not LOCAL_PLAYER then return end
 
 local TARGET_NAME = "Blackened"
 local TRAIL_DURATION = 7 * 60
-local HISTORY_INTERVAL = 2.5
+local HISTORY_INTERVAL = 2
 local MIN_STEP_DISTANCE = 1.5
 local RAYCAST_DISTANCE = 50
 local ARROW_SIZE = Vector3.new(3.4, 0.05, 3.4)
